@@ -32,7 +32,6 @@ from backend.graph.langgraph_flow import (
 )
 from backend.utils.erd import generate_erd
 
-# Load environment variables FIRST, before other imports that may rely on them
 load_dotenv(r"C:/Users/BM354VJ/OneDrive - EY/Desktop/agentic-data-modelling-backend/backend/.env")
 
 app = FastAPI(title="Agentic Schema Modelling Service", version="2.0.0")
@@ -45,10 +44,11 @@ app.add_middleware(
 )
 
 # ── Request / Response models ─────────────────────────────────────────────────
+
 class GenerateRequest(BaseModel):
     user_query: str
-    operation: Optional[str] = ""  # "CREATE" | "MODIFY" | "" (auto-classify)
-    existing_model: Optional[Dict[str, Any]] = None  # for MODIFY
+    operation: Optional[str] = ""
+    existing_model: Optional[Dict[str, Any]] = None
 
 
 class ValidateRequest(BaseModel):
@@ -68,26 +68,21 @@ class FeedbackRequest(BaseModel):
 
 
 class ERDRequest(BaseModel):
-    sql_output: Dict[str, Any]  # Contains combined_sql, relational_sql, analytical_sql
-    format: str = "svg"  # "svg" | "png" | "pdf"
+    sql_output: Dict[str, Any]
+    format: str = "svg"
 
 
 # ── Health ────────────────────────────────────────────────────────────────────
+
 @app.get("/health")
 def health():
     return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
 
 
 # ── Step 1: Generate data model JSON ─────────────────────────────────────────
+
 @app.post("/workflow/generate")
 def generate(req: GenerateRequest):
-    """
-    Generate a structured JSON data model (relational + analytical).
-    This is the first step for both CREATE and MODIFY operations.
-
-    For MODIFY, supply `existing_model` with the current model JSON.
-    The `operation` field may be left empty to auto-classify.
-    """
     try:
         result = run_generate_model(
             user_input=req.user_query,
@@ -103,15 +98,10 @@ def generate(req: GenerateRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ── Step 2a (AUTO): Validate model with LLM → generate SQL if valid ──────────
+# ── Step 2a (AUTO): Validate model → generate SQL if valid ───────────────────
+
 @app.post("/workflow/validate")
 def validate(req: ValidateRequest):
-    """
-    AUTO validation mode.
-    LLM validates the data model JSON.
-    If valid → SQL is generated and returned.
-    If invalid → validation errors are returned for the UI to retry.
-    """
     try:
         result = run_auto_validate_and_sql(req.data_model, req.operation)
         return {
@@ -124,12 +114,9 @@ def validate(req: ValidateRequest):
 
 
 # ── Step 2b (MANUAL): User approves → generate SQL ───────────────────────────
+
 @app.post("/workflow/approve")
 def approve(req: ApproveRequest):
-    """
-    MANUAL validation mode — user approved the model as-is.
-    Generates and returns SQL DDL scripts.
-    """
     try:
         result = run_approve_and_generate_sql(req.data_model, req.operation)
         return {
@@ -142,13 +129,9 @@ def approve(req: ApproveRequest):
 
 
 # ── Step 2c (MANUAL): User suggests changes → update model → generate SQL ────
+
 @app.post("/workflow/feedback")
 def feedback(req: FeedbackRequest):
-    """
-    MANUAL validation mode — user provided change requests.
-    Updates the data model based on feedback then generates SQL.
-    Returns both the updated model and SQL.
-    """
     try:
         result = run_apply_feedback_and_sql(
             data_model=req.data_model,
@@ -164,7 +147,8 @@ def feedback(req: FeedbackRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ── Step 3: Generate ERD from SQL ──────────────────────────────────────────────
+# ── Step 3: Generate ERD from SQL ────────────────────────────────────────────
+
 @app.post("/workflow/generate-erd")
 def generate_erd_diagram(req: ERDRequest):
     """
@@ -173,34 +157,41 @@ def generate_erd_diagram(req: ERDRequest):
     Returns the diagram as base64-encoded data.
     """
     try:
-        # Extract the combined SQL (fallback to relational if combined not available)
-        sql_text = req.sql_output.get("combined_sql") or req.sql_output.get("relational_sql", "")
-        
-        if not sql_text:
+        # FIX: validate format value before passing to Graphviz to avoid
+        # unexpected errors; default to "svg" if an unsupported value arrives.
+        fmt = req.format if req.format in ("svg", "png", "pdf") else "svg"
+
+        # Extract SQL — prefer combined_sql, fall back to relational_sql
+        sql_text = (
+            req.sql_output.get("combined_sql")
+            or req.sql_output.get("relational_sql", "")
+        )
+
+        if not sql_text or not sql_text.strip():
             raise ValueError("No SQL content available to generate ERD")
-        
-        # Generate the ERD; generate_erd may raise ValueError if parsing fails
-        dot_obj, dot_src = generate_erd([sql_text], fmt=req.format)
-        
-        # Render to a temporary file
+
+        # generate_erd raises ValueError if no CREATE TABLE statements are found
+        dot_obj, dot_src = generate_erd([sql_text], fmt=fmt)
+
+        # Render to a temporary file, read bytes, base64-encode for the response
         with tempfile.TemporaryDirectory() as tmpdir:
             output_path = os.path.join(tmpdir, "erd_output")
-            render_path = dot_obj.render(output_path, format=req.format, cleanup=True)
-            
-            # Read the file and encode as base64
+            # dot_obj.render() returns the path of the rendered file
+            render_path = dot_obj.render(output_path, format=fmt, cleanup=True)
+
             with open(render_path, "rb") as f:
                 diagram_data = base64.b64encode(f.read()).decode("utf-8")
-        
+
         return {
             "status": "success",
             "timestamp": datetime.utcnow().isoformat(),
             "diagram_data": diagram_data,
-            "format": req.format,
-            "dot_source": dot_src,  # Include DOT source for reference
+            "format": fmt,
+            "dot_source": dot_src,
         }
+
     except ValueError as e:
-        # Client-side error (likely bad/empty SQL) → 400
+        # Bad/empty SQL → tell the client clearly (400, not 500)
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        # Unhandled server error
         raise HTTPException(status_code=500, detail=str(e))
